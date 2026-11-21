@@ -1,0 +1,214 @@
+# Attestation spike workflow (synthetic artifacts only).
+#   blob job   G1 tarball attestation (SLSA provenance) + G1.b custom-predicate attestation.
+#              Runner selectable (G4 N3); runs alone for the G4 identity cases.
+#   image job  G1 OCI image on GHCR with its attestation pushed as a referrer, G8 referrer discovery,
+#              copy to a local registry and an OCI layout export. Skipped when inputs.image is false.
+# Evidence: artifacts "evidence-blob" and "evidence-image".
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner for the blob job
+        type: choice
+        options: [github-hosted, self-hosted]
+        default: github-hosted
+      image:
+        description: Also build, push and attest the image (G1/G8)
+        type: boolean
+        default: true
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  blob:
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted","spike-sandbox"]') || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # G4 N5b: under pull_request_target, build the PR head (the "pwn request" shape).
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || '' }}
+
+      - name: Build synthetic tarball
+        run: |
+          mkdir -p dist stage
+          printf 'hsp-demo %s built-from %s\n' "$GITHUB_SHA" "$(git rev-parse HEAD)" > stage/VERSION
+          cp image/payload.txt stage/
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C stage -cf - . | gzip -n > "dist/hsp-demo-${GITHUB_SHA::12}.tar.gz"
+          sha256sum dist/*.tar.gz | tee dist/SHA256SUMS
+
+      - name: Attest tarball
+        id: attest_blob
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Write catalog-shaped predicate (G1.b)
+        run: |
+          f=$(ls dist/*.tar.gz)
+          jq -n --arg name "$(basename "$f")" --arg sha "$(sha256sum "$f" | cut -d' ' -f1)" \
+                --arg ver "0.0.0-${GITHUB_SHA::12}" '{
+            catalog: {
+              name: "hsp-demo",
+              version: $ver,
+              channel: "spike",
+              entries: [ { kind: "tooling", name: $name, digest: { sha256: $sha } } ]
+            }
+          }' > predicate.json
+
+      - name: Attest tarball, custom predicate (G1.b)
+        id: attest_custom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+          predicate-type: https://hashsphere.io/spike/catalog/v0
+          predicate-path: predicate.json
+
+      - name: Collect evidence
+        env:
+          BLOB_BUNDLE: ${{ steps.attest_blob.outputs.bundle-path }}
+          CUSTOM_BUNDLE: ${{ steps.attest_custom.outputs.bundle-path }}
+        run: |
+          mkdir -p evidence
+          cp dist/* stage/VERSION predicate.json evidence/
+          cp "$BLOB_BUNDLE" evidence/blob.bundle.jsonl
+          cp "$CUSTOM_BUNDLE" evidence/custom.bundle.jsonl
+          {
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "built_from=$(git rev-parse HEAD)"
+            echo "workflow_ref=${GITHUB_WORKFLOW_REF}"
+            echo "repository=${GITHUB_REPOSITORY}"
+            echo "repository_id=${GITHUB_REPOSITORY_ID}"
+            echo "repository_owner_id=${GITHUB_REPOSITORY_OWNER_ID}"
+            echo "runner_environment=${RUNNER_ENVIRONMENT}"
+            echo "blob_attestation_id=${{ steps.attest_blob.outputs.attestation-id }}"
+            echo "custom_attestation_id=${{ steps.attest_custom.outputs.attestation-id }}"
+          } > evidence/run.env
+          cat evidence/run.env
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-blob
+          path: evidence/
+
+  image:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.image)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      packages: write
+    env:
+      IMAGE: ghcr.io/arsapto-llc/attest-spike
+    services:
+      registry:
+        image: registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: image
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Attest image (push referrer)
+        id: attest_image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - uses: oras-project/setup-oras@ac735097e22fe643015b0d19645f7c9a69942128 # v2.0.4
+        with:
+          version: 1.4.0
+
+      - name: Referrers on GHCR, copy, OCI layout (G8)
+        continue-on-error: true
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN_RO: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -x
+          mkdir -p evidence/g8
+          printf '%s' "$GH_TOKEN_RO" | oras login ghcr.io -u "$GH_ACTOR" --password-stdin
+          src="${IMAGE}@${IMAGE_DIGEST}"
+          oras discover --format json "$src" > evidence/g8/discover-ghcr.json
+          oras discover --format tree "$src" | tee evidence/g8/discover-ghcr.txt
+          # Does GHCR serve the OCI 1.1 referrers API, or only the tag-schema fallback?
+          tok=$(curl -fsS -u "${GH_ACTOR}:${GH_TOKEN_RO}" \
+            "https://ghcr.io/token?scope=repository:arsapto-llc/attest-spike:pull" | jq -r .token)
+          curl -sS -o evidence/g8/ghcr-referrers-api.json -w '%{http_code}\n' \
+            -H "Authorization: Bearer $tok" -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            "https://ghcr.io/v2/arsapto-llc/attest-spike/referrers/${IMAGE_DIGEST}" \
+            | tee evidence/g8/ghcr-referrers-api.status
+          oras repo tags "$IMAGE" | tee evidence/g8/ghcr-tags.txt
+          # Copy with referrers to a second registry (registry:3 service container).
+          dst="localhost:5000/attest-spike"
+          oras cp -r --to-plain-http "$src" "${dst}:copied" 2>&1 | tee evidence/g8/cp-local.txt
+          oras discover --plain-http --format json "${dst}@${IMAGE_DIGEST}" > evidence/g8/discover-local.json
+          oras discover --plain-http --format tree "${dst}@${IMAGE_DIGEST}" | tee evidence/g8/discover-local.txt
+          curl -sS -o evidence/g8/local-referrers-api.json -w '%{http_code}\n' \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            "http://localhost:5000/v2/attest-spike/referrers/${IMAGE_DIGEST}" \
+            | tee evidence/g8/local-referrers-api.status
+          oras repo tags --plain-http "$dst" | tee evidence/g8/local-tags.txt
+          # Air-gap shape: OCI layout with the image and its referrers.
+          oras cp -r --to-oci-layout "$src" "evidence/g8/oci-layout:copied" 2>&1 | tee evidence/g8/cp-layout.txt
+          oras discover --oci-layout --format json "evidence/g8/oci-layout@${IMAGE_DIGEST}" > evidence/g8/discover-layout.json
+
+      - name: Collect evidence
+        env:
+          IMAGE_BUNDLE: ${{ steps.attest_image.outputs.bundle-path }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p evidence
+          cp "$IMAGE_BUNDLE" evidence/image.bundle.jsonl
+          {
+            echo "image=${IMAGE}@${IMAGE_DIGEST}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+            echo "image_attestation_id=${{ steps.attest_image.outputs.attestation-id }}"
+          } > evidence/run.env
+          ls -lR evidence
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-image
+          path: evidence/
